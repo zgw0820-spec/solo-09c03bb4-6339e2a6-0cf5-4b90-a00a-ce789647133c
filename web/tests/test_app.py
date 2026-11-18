@@ -16,7 +16,14 @@ from cryptography.x509.oid import NameOID
 
 from app import certutil
 from app.certutil import CertError
-from app.service import BadRequest, CertService, Config, Conflict, ProbeError
+from app.service import (
+    BadRequest,
+    CertService,
+    Config,
+    Conflict,
+    ProbeError,
+    SiteUnavailable,
+)
 
 DOMAIN = "demo.internal"
 
@@ -30,12 +37,26 @@ class FakeControl:
         self.served: str | None = None
         self.reload_count = 0
         self.probe_error = False
+        # 设置后：前 N 次 probe 正常，之后抛 ProbeError（模拟启用中途 master 退出）
+        self.fail_after: int | None = None
+        # 置 True 后仅下一次 probe 正常返回，之后一律失败
+        # （模拟启用请求通过可达性预检后、执行期间 master 退出）
+        self.preflight_ok = False
+        self._probe_calls = 0
 
     def _live_fp(self):
         return self.service.live_fingerprint()
 
     def probe(self) -> str:
-        if self.probe_error:
+        self._probe_calls += 1
+        if self.preflight_ok:
+            self.preflight_ok = False
+            if self.served is None:
+                raise ProbeError("nothing served yet")
+            return self.served
+        if self.probe_error or (
+            self.fail_after is not None and self._probe_calls > self.fail_after
+        ):
             raise ProbeError("fake probe error")
         if self.served is None:
             raise ProbeError("nothing served yet")
@@ -75,6 +96,9 @@ def service(cfg):
     svc = CertService(cfg)
     svc.control = FakeControl(svc)
     svc.startup(background=False)
+    # 模拟真实 watcher：nginx 启动后即服务 live 目录中的种子证书
+    svc.control.served = svc.live_fingerprint()
+    svc.probe_cached(ttl=0.0)  # 预热探测缓存
     yield svc
     svc.shutdown()
 
@@ -235,14 +259,16 @@ def test_duplicate_submit_after_success_rejected(service):
         service.activate(v2["id"], base_version_id=1)  # 重复提交同一表单
 
 
-def test_reload_failure_rolls_back(service):
+def test_reload_failure_but_old_cert_confirmed_serving(service):
+    """fail 回执 + 新建握手确认旧版本仍在服务：据实判失败，文件回退。"""
     v2 = upload_new(service)
     old_fp = service.status(probe=False)["active"]["fingerprint"]
     service.control.served = old_fp  # nginx 当前服务旧证书
     service.control.receipt_mode = "fail"
     op = service.activate(v2["id"], base_version_id=1)
     assert op["state"] == "failed"
-    assert "重载失败" in op["detail"]
+    # 文案必须是"经握手确认旧版本仍在服务"，而非仅凭回执宣称沿用旧证书
+    assert "握手确认" in op["detail"]
     st = service.status(probe=False)
     assert st["active_version_id"] == 1
     # 文件已回滚，nginx 仍服务旧证书
@@ -250,6 +276,90 @@ def test_reload_failure_rolls_back(service):
     assert service.control.served == old_fp
     versions = {v["id"]: v["status"] for v in st["versions"]}
     assert versions[v2["id"]] == "failed"
+
+
+def test_reload_fail_but_unknown_fingerprint_stays_pending(service):
+    """fail 回执但实测到未登记指纹：无法判明实际服务版本，保持待核实。"""
+    v2 = upload_new(service)
+    service.control.served = "ab" * 32  # 未登记指纹
+    service.control.receipt_mode = "fail"
+    op = service.activate(v2["id"], base_version_id=1)
+    assert op["state"] == "pending_verify"
+    assert "待核实" in op["detail"]
+    # 未结案前在用版本不得变动
+    assert service.status(probe=False)["active_version_id"] == 1
+
+
+def test_site_unavailable_rejects_new_activation(service):
+    """站点不可达期间：新启用请求直接 503，不产生在途操作、不动文件。"""
+    v2 = upload_new(service)
+    old_fp = service.live_fingerprint()
+    service.control.probe_error = True
+    with pytest.raises(SiteUnavailable):
+        service.activate(v2["id"], base_version_id=1)
+    # 没有登记任何操作，live 文件未被触碰
+    assert service.status(probe=False)["ops"] == []
+    assert service.live_fingerprint() == old_fp
+    assert service.control.reload_count == 0
+    # 状态接口显式标记不可达
+    assert service.status()["site_available"] is False
+
+
+def test_activation_during_outage_stays_pending_until_recovery(service):
+    """在途操作遭遇站点宕机：保持待核实；watcher 拉起后按实测版本结案。"""
+    v2 = upload_new(service)
+    target_fp = v2["fingerprint"]
+    # 启用前探测正常（可接单），通过预检后站点立刻不可达（master 退出）
+    service.control.preflight_ok = True
+    service.control.probe_error = True
+    op = service.activate(v2["id"], base_version_id=1)
+    assert op["state"] == "pending_verify"
+    assert service.status(probe=False)["active_version_id"] == 1
+    # 宕机期间后台核实不得结案
+    service.reconcile_once()
+    assert service.get_op(op["seq"])["state"] == "pending_verify"
+    # 站点恢复：watcher 重新拉起 nginx，加载当前 live（目标证书）
+    service.control.probe_error = False
+    service.control.served = target_fp
+    service.reconcile_once()
+    assert service.get_op(op["seq"])["state"] == "succeeded"
+    assert service.status(probe=False)["active_version_id"] == v2["id"]
+    # 恢复后重新接单
+    assert service.status()["site_available"] is True
+
+
+def test_recovery_confirms_old_version_then_closes_op(service):
+    """恢复后握手判明实际服务的是旧已登记版本：据实判失败并回退文件。"""
+    v2 = upload_new(service)
+    old_fp = service.status(probe=False)["active"]["fingerprint"]
+    service.control.preflight_ok = True
+    service.control.probe_error = True
+    op = service.activate(v2["id"], base_version_id=1)
+    assert op["state"] == "pending_verify"
+    # watcher 拉起 nginx，但加载的仍是旧证书（重载未生效，live 已被运维回滚）
+    service._write_live(service._version(1))
+    service.control.probe_error = False
+    service.control.served = old_fp
+    service.reconcile_once()
+    op = service.get_op(op["seq"])
+    assert op["state"] == "failed"
+    assert "已登记版本 #1" in op["detail"]
+    assert service.live_fingerprint() == old_fp
+    assert service.status(probe=False)["active_version_id"] == 1
+
+
+def test_unverified_fingerprint_keeps_pending_forever(service):
+    """恢复后实测指纹始终未登记：一直保持待核实，不得超时强行结案。"""
+    v2 = upload_new(service)
+    service.control.receipt_mode = "timeout"
+    service.control.served = "cd" * 32  # 未登记
+    op = service.activate(v2["id"], base_version_id=1)
+    assert op["state"] == "pending_verify"
+    import time
+
+    time.sleep(0.6)  # 超过 pending_ttl
+    service.reconcile_once()
+    assert service.get_op(op["seq"])["state"] == "pending_verify"
 
 
 def test_receipt_timeout_goes_pending_then_confirms(service):
@@ -309,16 +419,27 @@ def test_old_pending_op_cannot_overwrite_newer(service):
 # ---------------------------------------------------------------- 重启恢复
 
 
-def restart(service_factory_cfg):
-    svc = CertService(service_factory_cfg)
+def start_service(svc):
+    """挂上 FakeControl，startup，并模拟 watcher 已拉起 nginx 服务种子证书。"""
     svc.control = FakeControl(svc)
+    svc.startup(background=False)
+    svc.control.served = svc.live_fingerprint()
+    svc.probe_cached(ttl=0.0)  # 预热探测缓存，等价于 nginx 已在监听
+    return svc
+
+
+def restart_service(cfg, served):
+    """模拟进程重启：新实例 + FakeControl，按给定实测指纹完成启动对账。"""
+    svc = CertService(cfg)
+    svc.control = FakeControl(svc)
+    svc.control.served = served
+    svc.startup(background=False)
+    svc.probe_cached(ttl=0.0)
     return svc
 
 
 def test_restart_confirms_successful_activation(cfg):
-    svc = CertService(cfg)
-    svc.control = FakeControl(svc)
-    svc.startup(background=False)
+    svc = start_service(CertService(cfg))
     v2 = upload_new(svc)
     svc.control.receipt_mode = "timeout"
     op = svc.activate(v2["id"], base_version_id=1)
@@ -326,9 +447,7 @@ def test_restart_confirms_successful_activation(cfg):
     # 模拟进程崩溃：nginx 实际已切到新证书
     served = svc.live_fingerprint()
     svc.shutdown()
-    svc2 = restart(cfg)
-    svc2.control.served = served
-    svc2.startup(background=False)
+    svc2 = restart_service(cfg, served)
     st = svc2.status(probe=False)
     assert st["active_version_id"] == v2["id"]
     assert svc2.get_op(op["seq"])["state"] == "succeeded"
@@ -336,9 +455,7 @@ def test_restart_confirms_successful_activation(cfg):
 
 
 def test_restart_rolls_back_unconfirmed_activation(cfg):
-    svc = CertService(cfg)
-    svc.control = FakeControl(svc)
-    svc.startup(background=False)
+    svc = start_service(CertService(cfg))
     v2 = upload_new(svc)
     old_fp = svc.status(probe=False)["active"]["fingerprint"]
     svc.control.receipt_mode = "timeout"
@@ -346,9 +463,7 @@ def test_restart_rolls_back_unconfirmed_activation(cfg):
     assert op["state"] == "pending_verify"
     # 进程崩溃时 nginx 仍服务旧证书
     svc.shutdown()
-    svc2 = restart(cfg)
-    svc2.control.served = old_fp
-    svc2.startup(background=False)
+    svc2 = restart_service(cfg, old_fp)
     st = svc2.status(probe=False)
     assert st["active_version_id"] == 1
     assert svc2.get_op(op["seq"])["state"] == "failed"
@@ -358,9 +473,7 @@ def test_restart_rolls_back_unconfirmed_activation(cfg):
 
 def test_restart_with_activating_op_recovered(cfg):
     """进程在操作处于 activating 时崩溃（未留下任何终态）。"""
-    svc = CertService(cfg)
-    svc.control = FakeControl(svc)
-    svc.startup(background=False)
+    svc = start_service(CertService(cfg))
     v2 = upload_new(svc)
     old_fp = svc.status(probe=False)["active"]["fingerprint"]
     # 手工制造一个悬空的 activating 操作（等价于崩溃瞬间）
@@ -375,18 +488,29 @@ def test_restart_with_activating_op_recovered(cfg):
         )
         c.execute("UPDATE state SET current_op_seq=?", (seq,))
     svc.shutdown()
-    svc2 = restart(cfg)
-    svc2.control.served = old_fp
-    svc2.startup(background=False)
+    svc2 = restart_service(cfg, old_fp)
     assert svc2.get_op(seq)["state"] == "failed"
     assert svc2.status(probe=False)["active_version_id"] == 1
     svc2.shutdown()
 
 
+def test_restart_with_unregistered_served_fingerprint_stays_pending(cfg):
+    """重启后实测指纹未登记：无法判明实际服务版本，必须保持待核实。"""
+    svc = start_service(CertService(cfg))
+    v2 = upload_new(svc)
+    svc.control.receipt_mode = "timeout"
+    op = svc.activate(v2["id"], base_version_id=1)
+    assert op["state"] == "pending_verify"
+    svc.shutdown()
+    svc2 = restart_service(cfg, "ef" * 32)  # 未登记指纹
+    assert svc2.get_op(op["seq"])["state"] == "pending_verify"
+    # 在用版本不得被任何结论性动作改动
+    assert svc2.status(probe=False)["active_version_id"] == 1
+    svc2.shutdown()
+
+
 def test_restart_restores_tampered_live_files(cfg):
-    svc = CertService(cfg)
-    svc.control = FakeControl(svc)
-    svc.startup(background=False)
+    svc = start_service(CertService(cfg))
     active_fp = svc.status(probe=False)["active"]["fingerprint"]
     # 带外篡改 live 文件
     chain, key = make_cert(svc)
@@ -394,9 +518,7 @@ def test_restart_restores_tampered_live_files(cfg):
         f.write(chain)
     assert svc.live_fingerprint() != active_fp
     svc.shutdown()
-    svc2 = restart(cfg)
-    svc2.control.served = active_fp
-    svc2.startup(background=False)
+    svc2 = restart_service(cfg, active_fp)
     assert svc2.live_fingerprint() == active_fp
     assert svc2.control.reload_count >= 1  # 触发了恢复重载
     svc2.shutdown()

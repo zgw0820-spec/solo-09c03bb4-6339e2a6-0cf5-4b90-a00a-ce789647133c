@@ -4,8 +4,12 @@
 - 启用请求带"页面所见版号"(base_version_id)，在 BEGIN IMMEDIATE 事务内
   比较-交换，过期提交与并发重复提交直接拒绝，不会覆盖在用证书。
 - 启用成功以"Nginx 新建 TLS 连接返回新证书指纹"为唯一判据；
-  重载回执失败 -> 回滚文件并保持旧版本在用；
-  回执不明/无法探测 -> 置"待核实"，由后台核实循环继续处理。
+  重载回执失败不代表旧证书仍在服务，必须再做新建握手核实：
+  实测旧版本仍在服务才据实判失败并回退文件；无法核实一律置"待核实"，
+  任何情况下都不凭回执文案宣称"旧证书仍在服务"。
+- 站点不可达（无法新建 TLS 握手）期间拒绝新的启用请求；已在途的操作
+  保持待核实，待进程恢复后用新建握手判明实际服务的已登记版本再结案，
+  仍无法核实（如实测指纹未登记）则继续保持待核实。
 - 任何落库/写文件动作前都检查"自己是否仍是最新操作"，
   旧操作不得覆盖后来提交。
 - 进程重启时按 Nginx 实际服务的指纹对账，恢复到可确认的在用版本。
@@ -45,6 +49,10 @@ class BadRequest(Exception):
 
 class NotFound(Exception):
     """404：目标不存在。"""
+
+
+class SiteUnavailable(Exception):
+    """503：站点无法建立新 TLS 连接，当前不接受新的启用请求。"""
 
 
 class ProbeError(Exception):
@@ -163,6 +171,10 @@ class CertService:
         self._thread: threading.Thread | None = None
         self._probe_cache: tuple[float, str | None] = (0.0, None)
         self._last_restore = 0.0
+        # 最近一次"进程恢复"时刻：用于在途操作恢复后首轮核实即结案，不必等 TTL
+        self._recovered_at = 0.0
+        # 后台核实循环上一轮观测到的站点可达性（恢复边沿检测）
+        self._last_reconcile_available = True
 
     # ------------------------------------------------------------ 生命周期
 
@@ -187,10 +199,17 @@ class CertService:
             target = self._version(op["version_id"])
             if served is not None and served == target["fingerprint"]:
                 self._finalize_success(op["seq"], note="重启后核实：新证书已生效")
-            elif served is not None:
+            elif served is not None and self._version_by_fingerprint(served) is not None:
                 self._recover_to_confirmable(served)
                 self._finalize_fail(
-                    op["seq"], "进程重启，启用结果未确认，已恢复到可确认的在用版本"
+                    op["seq"],
+                    "进程重启，新建 TLS 握手确认实际服务的是其他已登记版本，"
+                    "已恢复到可确认的在用版本",
+                )
+            elif served is not None:
+                # 实测指纹未登记：无法判明实际服务版本，保持待核实
+                log.warning(
+                    "startup: 实测指纹未登记，操作 #%s 保持待核实", op["seq"]
                 )
             else:
                 log.warning("startup: 无法探测 Nginx，操作 #%s 保持待核实", op["seq"])
@@ -268,6 +287,12 @@ class CertService:
 
     def activate(self, version_id: int, base_version_id: int) -> dict:
         """提交启用。比较-交换通过后在请求线程内同步执行，结果有界。"""
+        # 站点不可达期间拒绝新启用：不写文件、不发重载、不留在途操作
+        if self.probe_cached(ttl=0.0) is None:
+            raise SiteUnavailable(
+                "当前无法与站点建立新 TLS 连接（Nginx 可能正在恢复），"
+                "已暂停证书启用；站点恢复后会自动结案在途操作并重新接单"
+            )
         with self.db.txn() as c:
             st = c.execute("SELECT * FROM state WHERE id=1").fetchone()
             if st["active_version_id"] != base_version_id:
@@ -321,7 +346,7 @@ class CertService:
         token = f"{seq}-{uuid.uuid4().hex[:8]}"
         self.control.request_reload(token)
         receipt = self.control.wait_receipt(token, self.cfg.receipt_timeout)
-        # 3. 以新建 TLS 连接的实际握手结果为准
+        # 3. 以新建 TLS 连接的实际握手结果为唯一判据
         served = None
         deadline = time.monotonic() + self.cfg.verify_timeout
         while time.monotonic() < deadline:
@@ -331,29 +356,53 @@ class CertService:
                 served = None
             if served == target["fingerprint"]:
                 break
-            if receipt is not None and receipt.startswith("fail"):
+            # 站点仍不可达时继续等待：master 可能正被 watcher 自动拉起
+            if served is not None and receipt is not None and receipt.startswith("fail"):
                 break
             time.sleep(self.cfg.probe_interval)
-        # 4. 判定
+        # 4. 判定：任何结论都必须有新建握手实测支撑
         if served == target["fingerprint"]:
             self._finalize_success(seq, note="新 TLS 连接已返回新证书")
             return
+        if served is None:
+            # 站点全程不可达：重载是否成功无从核实，保持待核实；
+            # 不回滚文件——master 恢复后加载的就是当前 live（target），
+            # 后台核实用实测指纹据实结案。
+            reason = "重载回执超时" if receipt is None else "站点无法建立新 TLS 连接"
+            self._mark_pending(seq, f"{reason}，实际服务版本待核实")
+            return
+        # 站点可达但服务的不是目标证书。
         if receipt is not None and receipt.startswith("fail"):
+            # 重载已明确失败：先把 live 文件回退到提交时的在用版本，
+            # 再按实测指纹据实结案——"旧证书仍在服务"必须由握手确认。
             self._rollback_files(base)
-            self._finalize_fail(seq, f"Nginx 重载失败（{receipt}），已沿用旧证书")
+            known = self._version_by_fingerprint(served)
+            if known is None:
+                # 实测指纹未登记：无法判明实际服务版本，保持待核实
+                self._mark_pending(seq, "重载失败且实测指纹未登记，实际服务版本待核实")
+                return
+            if served == base["fingerprint"]:
+                detail = (
+                    f"Nginx 重载未生效（回执：{receipt}），"
+                    "新建 TLS 握手确认旧版本仍在服务，已回退"
+                )
+            else:
+                detail = (
+                    f"新建 TLS 握手显示实际服务的是已登记版本 #{known['id']}，"
+                    "并非目标版本，已回退到提交时的在用版本"
+                )
+            self._finalize_fail(seq, detail)
             return
-        if receipt == "ok" and served is not None:
-            self._rollback_files(base)
-            self._finalize_fail(seq, "重载后新连接仍返回旧证书，已回退并保持旧证书在用")
-            return
-        # 回执不明或无法探测 -> 待核实
-        reason = "重载回执超时" if receipt is None else "无法建立新连接核实"
-        self._mark_pending(seq, f"{reason}，待核实")
+        # 回执超时或回执成功但实测非目标：重载可能延迟生效，不回滚、不结案，
+        # 保持待核实，由后台核实循环继续用新建握手跟进
+        self._mark_pending(seq, "重载结果与实测不一致或回执不明，实际服务版本待核实")
 
     # ------------------------------------------------------------ 终态落库
 
     def _invalidate_probe(self) -> None:
-        self._probe_cache = (0.0, None)
+        # 仅把时间戳置 0 强制下次重新探测；保留旧值可避免"刚失效即被当成不可达"
+        ts, val = self._probe_cache
+        self._probe_cache = (0.0, val)
 
     def _finalize_success(self, seq: int, note: str = "") -> None:
         with self.db.txn() as c:
@@ -444,6 +493,17 @@ class CertService:
                 " ORDER BY seq DESC LIMIT 1"
             ).fetchone()
             st = c.execute("SELECT * FROM state WHERE id=1").fetchone()
+        try:
+            served = self.control.probe()
+        except ProbeError:
+            served = None
+        # 记录"不可达 -> 恢复"边沿：在途操作恢复后首轮即可据实结案
+        available = served is not None
+        if available and not self._last_reconcile_available:
+            self._recovered_at = time.monotonic()
+            log.info("reconcile: 站点已恢复，实测指纹 %.16s…", served)
+        self._last_reconcile_available = available
+        self._probe_cache = (time.monotonic(), served)
         if op:
             if st["current_op_seq"] != op["seq"]:
                 with self.db.txn() as c:
@@ -454,28 +514,36 @@ class CertService:
                     )
                 return
             target = self._version(op["version_id"])
-            try:
-                served = self.control.probe()
-            except ProbeError:
-                return  # 无法确认，保持待核实
+            if served is None:
+                return  # 仍无法核实，保持待核实，不做任何结论性落库/回退
             if served == target["fingerprint"]:
                 self._finalize_success(op["seq"], note="后台核实：新证书已生效")
                 return
+            known = self._version_by_fingerprint(served)
+            if known is None:
+                # 实测指纹未登记：无法判明实际服务版本，保持待核实
+                return
             created = dt.datetime.fromisoformat(op["created_at"])
             age = (dt.datetime.now(UTC) - created).total_seconds()
-            if age > self.cfg.pending_ttl:
+            recovered_recently = (
+                self._recovered_at
+                and time.monotonic() - self._recovered_at < self.cfg.restore_interval
+            )
+            # 进程恢复后握手已判明实际服务的是另一个已登记版本 -> 立即结案；
+            # 否则沿用待核实宽限期，超时再回退。
+            if recovered_recently or age > self.cfg.pending_ttl:
                 active = self._version(st["active_version_id"])
                 self._rollback_files(active)
                 self._finalize_fail(
-                    op["seq"], "超过待核实时限仍未生效，已回退到可确认的在用版本"
+                    op["seq"],
+                    f"新建 TLS 握手确认实际服务的是已登记版本 #{known['id']}，"
+                    "目标版本未生效，已回退到可确认的在用版本",
                 )
             return
         # 无在途操作：保持"文件/实测/在用"三者一致（限流）
         if time.monotonic() - self._last_restore < self.cfg.restore_interval:
             return
-        try:
-            served = self.control.probe()
-        except ProbeError:
+        if served is None:
             return
         active = self._version(st["active_version_id"])
         if active and served != active["fingerprint"]:
@@ -567,6 +635,7 @@ class CertService:
             consistency = "mismatch"
         return {
             "domain": self.cfg.site_domain,
+            "site_available": served is not None,
             "served_fingerprint": served,
             "consistency": consistency,
             "active_version_id": st["active_version_id"],
@@ -602,6 +671,14 @@ class CertService:
             return None
         with self.db.txn() as c:
             row = c.execute("SELECT * FROM versions WHERE id=?", (vid,)).fetchone()
+            return dict(row) if row else None
+
+    def _version_by_fingerprint(self, fingerprint: str) -> dict | None:
+        """按指纹查已登记版本：实测指纹无法对应登记版本时不得下结论。"""
+        with self.db.txn() as c:
+            row = c.execute(
+                "SELECT * FROM versions WHERE fingerprint=?", (fingerprint,)
+            ).fetchone()
             return dict(row) if row else None
 
     @staticmethod

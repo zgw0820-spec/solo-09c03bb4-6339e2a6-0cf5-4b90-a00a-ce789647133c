@@ -10,7 +10,14 @@ from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
 from . import certutil
-from .service import BadRequest, CertService, Conflict, Config, NotFound
+from .service import (
+    BadRequest,
+    CertService,
+    Conflict,
+    Config,
+    NotFound,
+    SiteUnavailable,
+)
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s"
@@ -95,6 +102,8 @@ def activate(
 ):
     try:
         op = service.activate(version_id, base_version_id)
+    except SiteUnavailable as exc:
+        return _respond(request, redirect, {"err": str(exc)}, 503)
     except Conflict as exc:
         return _respond(request, redirect, {"err": str(exc)}, 409)
     except BadRequest as exc:

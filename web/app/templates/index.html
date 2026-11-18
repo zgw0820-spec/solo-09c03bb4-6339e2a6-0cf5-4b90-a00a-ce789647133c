@@ -29,11 +29,19 @@
 {% if msg %}<div class="banner msg">{{ msg }}</div>{% endif %}
 {% if err %}<div class="banner err">{{ err }}</div>{% endif %}
 
+{% if not st.site_available %}
+<div class="banner err" style="font-weight:600">
+  站点当前无法建立新 TLS 连接（Nginx 可能正在恢复）：已暂停新的证书启用，
+  在途操作保持“待核实”。watcher 会自动拉起站点进程，恢复后系统将以新建
+  TLS 握手核实实际服务版本并自动结案，届时重新开放启用。
+</div>
+{% endif %}
+
 <div class="card">
   <h2>当前状态</h2>
   <p>Nginx 实测指纹（新建 TLS 连接）：
     {% if st.served_fingerprint %}<code>{{ st.served_fingerprint }}</code>
-    {% else %}<span class="warn">无法连接 Nginx，待核实</span>{% endif %}</p>
+    {% else %}<span class="bad">无法连接 Nginx，待核实</span>{% endif %}</p>
   {% if st.active %}
   <p>在用版本：#{{ st.active.id }}（指纹 <code>{{ st.active.fingerprint }}</code>）<br>
      域名：{{ st.active.san }} ｜ 有效期：{{ st.active.not_before[:10] }} ~ {{ st.active.not_after[:10] }}</p>
@@ -73,7 +81,12 @@
         <input type="hidden" name="version_id" value="{{ v.id }}">
         <input type="hidden" name="base_version_id" value="{{ st.active_version_id }}">
         <input type="hidden" name="redirect" value="1">
+        {% if st.site_available %}
         <button type="submit">启用（基于在用版号 #{{ st.active_version_id }}）</button>
+        {% else %}
+        <button type="submit" disabled
+          title="站点不可达，恢复并核实在途操作后重新开放">启用（暂停中）</button>
+        {% endif %}
       </form>
       {% else %}—{% endif %}
     </td>

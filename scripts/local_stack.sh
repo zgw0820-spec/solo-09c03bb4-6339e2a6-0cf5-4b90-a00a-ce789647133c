@@ -48,8 +48,19 @@ start_nginx() {
   write_nginx_conf
   RELOAD_DIR="$WORK/reload" LIVE_DIR="$WORK/live" NGINX_BIN="$NGINX_BIN" \
     NGINX_ARGS="-p $NGX -c $NGX/nginx.conf" \
+    NGINX_PID_FILE="$RUN/nginx.pid" \
     nohup sh "$ROOT/nginx/reload-watcher.sh" > "$WORK/watcher.log" 2>&1 &
   echo $! > "$RUN/watcher.pid"
+}
+
+# 按本工作目录的特征清理所有残留进程（含孤儿 watcher / nginx / web），
+# 避免多个 watcher 同时看守、互相抢端口或抢先拉起 nginx。
+cleanup_all() {
+  pkill -f "reload-watcher.sh" 2>/dev/null || true
+  pkill -f "$NGX/nginx.conf" 2>/dev/null || true
+  pkill -f "uvicorn app.main:app" 2>/dev/null || true
+  rm -f "$RUN/watcher.pid" "$RUN/web.pid" "$RUN/nginx.pid"
+  sleep 0.3
 }
 
 start_web() {
@@ -84,6 +95,7 @@ wait_tls() {
 case "${1:-}" in
   up)
     mkdir -p "$WORK/data" "$WORK/live" "$WORK/reload" "$RUN"
+    cleanup_all
     start_nginx
     start_web
     wait_web
@@ -91,11 +103,7 @@ case "${1:-}" in
     echo "UP  web=http://127.0.0.1:$WEB_PORT  tls=https://127.0.0.1:$TLS_PORT"
     ;;
   down)
-    for p in watcher web; do
-      [ -f "$RUN/$p.pid" ] && kill "$(cat "$RUN/$p.pid")" 2>/dev/null || true
-    done
-    [ -f "$RUN/nginx.pid" ] && kill "$(cat "$RUN/nginx.pid")" 2>/dev/null || true
-    sleep 0.5
+    cleanup_all
     echo "DOWN"
     ;;
   restart-web)
@@ -109,9 +117,35 @@ case "${1:-}" in
     kill -9 "$(cat "$RUN/web.pid")" 2>/dev/null || true
     echo "WEB KILLED"
     ;;
+  kill-nginx)  # 模拟 nginx master 意外退出（watcher 应自动拉起）
+    if [ -f "$RUN/nginx.pid" ]; then
+      MPID=$(cat "$RUN/nginx.pid")
+      kill -9 "$MPID" 2>/dev/null || true
+      # master 被 SIGKILL 后 worker 会成为孤儿继续占用端口，一并清掉
+      pkill -9 -P 1 -f "$NGX/nginx.conf" 2>/dev/null || true
+      pkill -9 -f "nginx: worker" 2>/dev/null || true
+      rm -f "$RUN/nginx.pid"
+      echo "NGINX MASTER KILLED (pid=$MPID)"
+    else
+      echo "nginx pid 文件不存在" >&2; exit 1
+    fi
+    ;;
+  start-watcher)  # 仅（重新）启动 watcher，用于模拟 watcher 恢复接管
+    start_nginx
+    echo "WATCHER STARTED (pid=$(cat "$RUN/watcher.pid"))"
+    ;;
+  stop-watcher)
+    [ -f "$RUN/watcher.pid" ] && kill "$(cat "$RUN/watcher.pid")" 2>/dev/null || true
+    pkill -f "reload-watcher.sh" 2>/dev/null || true
+    rm -f "$RUN/watcher.pid"
+    echo "WATCHER STOPPED"
+    ;;
+  nginx-pid)
+    cat "$RUN/nginx.pid" 2>/dev/null || true
+    ;;
   status)
     curl -s "http://127.0.0.1:$WEB_PORT/api/status" | python3 -m json.tool | head -40
     ;;
   *)
-    echo "usage: $0 up|down|restart-web|kill-web|status" >&2; exit 2;;
+    echo "usage: $0 up|down|restart-web|kill-web|kill-nginx|nginx-pid|status" >&2; exit 2;;
 esac
